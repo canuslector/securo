@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from app.models.user import User
 from app.providers.market_price import (
     MarketPriceProvider,
     MarketPriceRateLimitedError,
+    YFinanceProvider,
 )
 from app.schemas.asset import (
     AssetCreate,
@@ -422,3 +424,67 @@ async def test_refresh_all_halts_on_rate_limit(
     # skipped bucket, no per-asset fallback was attempted.
     assert result["refreshed"] == 0
     assert result["skipped"] == 2
+
+
+# ---- YFinanceProvider batch refresh: minor-unit normalization ----
+
+
+@pytest.mark.asyncio
+async def test_yfinance_batch_normalizes_gbp_pence_to_pounds():
+    # yf.download reports LSE tickers in pence; the batch path must scale
+    # them to pounds the same way get_quote does at creation.
+    provider = YFinanceProvider()
+    with (
+        patch.object(
+            YFinanceProvider,
+            "_download_prices_sync",
+            return_value={"EQQQ.L": Decimal("38450")},
+        ),
+        patch.object(
+            YFinanceProvider,
+            "_get_currencies_sync",
+            return_value={"EQQQ.L": "GBp"},
+        ) as currencies,
+    ):
+        prices = await provider.get_latest_prices(["EQQQ.L"])
+
+    currencies.assert_called_once_with(["EQQQ.L"])
+    assert float(prices["EQQQ.L"]) == pytest.approx(384.50)
+
+
+@pytest.mark.asyncio
+async def test_yfinance_batch_normalizes_zac_cents_to_rand():
+    provider = YFinanceProvider()
+    with (
+        patch.object(
+            YFinanceProvider,
+            "_download_prices_sync",
+            return_value={"NPN.JO": Decimal("612300")},
+        ),
+        patch.object(
+            YFinanceProvider,
+            "_get_currencies_sync",
+            return_value={"NPN.JO": "ZAc"},
+        ),
+    ):
+        prices = await provider.get_latest_prices(["NPN.JO"])
+
+    assert float(prices["NPN.JO"]) == pytest.approx(6123.00)
+
+
+@pytest.mark.asyncio
+async def test_yfinance_batch_leaves_usd_ticker_unchanged():
+    # No *.L / *.JO suffix → no currency lookup at all, price passes through.
+    provider = YFinanceProvider()
+    with (
+        patch.object(
+            YFinanceProvider,
+            "_download_prices_sync",
+            return_value={"AAPL": Decimal("181.25")},
+        ),
+        patch.object(YFinanceProvider, "_get_currencies_sync") as currencies,
+    ):
+        prices = await provider.get_latest_prices(["AAPL"])
+
+    currencies.assert_not_called()
+    assert prices["AAPL"] == Decimal("181.25")

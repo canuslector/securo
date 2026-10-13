@@ -172,14 +172,10 @@ class YFinanceProvider(MarketPriceProvider):
         creation time; we just update the price and let ``current_value``
         recompute from ``units × last_price``.
 
-        Note on minor-unit currencies (GBp, ZAc on LSE/JSE): those are
-        normalized to GBP/ZAR ×0.01 at creation (via ``get_quote``), but
-        on refresh we only get the raw trading-currency close. The batch
-        preserves the same unit as the upstream quote, so internal
-        consistency is maintained as long as the asset's stored currency
-        matches the ticker's reporting unit. If Yahoo changes a listing's
-        reporting unit mid-stream the price will appear off by 100× — rare
-        enough to address reactively rather than pre-emptively.
+        Note on minor-unit currencies (GBp, ZAc on LSE/JSE): ``download``
+        returns the raw pence/cents close, so ``*.L`` / ``*.JO`` tickers get
+        a follow-up ``fast_info.currency`` lookup and are scaled ×0.01 to
+        match the GBP/ZAR normalization ``get_quote`` applies at creation.
         """
         if not symbols:
             return {}
@@ -196,6 +192,37 @@ class YFinanceProvider(MarketPriceProvider):
                 raise MarketPriceRateLimitedError(
                     "Yahoo Finance rate-limited the batch price download"
                 )
+
+            # Normalize minor-unit prices (GBp → GBP, ZAc → ZAR, both ×0.01).
+            # yf.download returns raw pence/cents for LSE/JSE tickers without
+            # a currency tag; we fetch fast_info.currency only for the tickers
+            # that actually need it (*.L and *.JO suffixes) to keep the extra
+            # round-trips minimal.
+            candidates = [
+                s for s, p in chunk_prices.items()
+                if p is not None and (s.endswith(".L") or s.endswith(".JO"))
+            ]
+            if candidates:
+                try:
+                    currencies = await asyncio.to_thread(
+                        self._get_currencies_sync, candidates
+                    )
+                    for sym, raw_price in chunk_prices.items():
+                        if raw_price is None:
+                            continue
+                        currency = currencies.get(sym)
+                        if currency and currency in _MINOR_UNIT_CURRENCIES:
+                            _, multiplier = _MINOR_UNIT_CURRENCIES[currency]
+                            chunk_prices[sym] = Decimal(
+                                str(float(raw_price) * multiplier)
+                            )
+                except Exception as e:  # pragma: no cover — best-effort, never block refresh
+                    logger.warning(
+                        "minor-unit currency check failed for %s; prices stored raw: %s",
+                        candidates,
+                        e,
+                    )
+
             out.update(chunk_prices)
         return out
 
@@ -252,6 +279,26 @@ class YFinanceProvider(MarketPriceProvider):
         except Exception as e:  # pragma: no cover — upstream flakiness, not logic
             logger.warning("yfinance search failed for %r: %s", query, e)
             return []
+
+    @staticmethod
+    def _get_currencies_sync(symbols: list[str]) -> dict[str, Optional[str]]:
+        """Return ``fast_info.currency`` for each symbol.
+
+        Used by ``get_latest_prices`` to identify minor-unit tickers (GBp,
+        ZAc) after a ``yf.download`` batch, which returns raw prices without
+        currency metadata. Only called for the small subset of tickers whose
+        exchange suffix suggests a minor-unit quote (``*.L``, ``*.JO``).
+        """
+        import yfinance as yf
+
+        out: dict[str, Optional[str]] = {}
+        for sym in symbols:
+            try:
+                currency = _fast_info_value(yf.Ticker(sym).fast_info, "currency")
+                out[sym] = str(currency) if currency is not None else None
+            except Exception:
+                out[sym] = None
+        return out
 
     @staticmethod
     def _download_prices_sync(symbols: list[str]) -> dict[str, Optional[Decimal]]:
