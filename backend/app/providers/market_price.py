@@ -176,6 +176,8 @@ class YFinanceProvider(MarketPriceProvider):
         returns the raw pence/cents close, so ``*.L`` / ``*.JO`` tickers get
         a follow-up ``fast_info.currency`` lookup and are scaled ×0.01 to
         match the GBP/ZAR normalization ``get_quote`` applies at creation.
+        If that lookup fails for a ticker its price is returned as ``None``
+        rather than raw, so the caller falls back to ``get_quote``.
         """
         if not symbols:
             return {}
@@ -207,21 +209,22 @@ class YFinanceProvider(MarketPriceProvider):
                     currencies = await asyncio.to_thread(
                         self._get_currencies_sync, candidates
                     )
-                    for sym, raw_price in chunk_prices.items():
-                        if raw_price is None:
-                            continue
-                        currency = currencies.get(sym)
-                        if currency and currency in _MINOR_UNIT_CURRENCIES:
-                            _, multiplier = _MINOR_UNIT_CURRENCIES[currency]
-                            chunk_prices[sym] = Decimal(
-                                str(float(raw_price) * multiplier)
-                            )
-                except Exception as e:  # pragma: no cover — best-effort, never block refresh
+                except Exception as e:  # pragma: no cover — upstream flakiness, not logic
                     logger.warning(
-                        "minor-unit currency check failed for %s; prices stored raw: %s",
-                        candidates,
-                        e,
+                        "minor-unit currency check failed for %s: %s", candidates, e
                     )
+                    currencies = {}
+                for sym in candidates:
+                    currency = currencies.get(sym)
+                    if not currency:
+                        # Unit unknown — a raw pence/cents close could be
+                        # 100× off, so drop it and let the caller fall back
+                        # to ``get_quote``, which normalizes on its own.
+                        chunk_prices[sym] = None
+                        continue
+                    conv = _MINOR_UNIT_CURRENCIES.get(currency)
+                    if conv is not None:
+                        chunk_prices[sym] = chunk_prices[sym] * Decimal(str(conv[1]))
 
             out.update(chunk_prices)
         return out
