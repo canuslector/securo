@@ -223,8 +223,9 @@ class YFinanceProvider(MarketPriceProvider):
                         chunk_prices[sym] = None
                         continue
                     conv = _MINOR_UNIT_CURRENCIES.get(currency)
-                    if conv is not None:
-                        chunk_prices[sym] = chunk_prices[sym] * Decimal(str(conv[1]))
+                    price = chunk_prices[sym]
+                    if conv is not None and price is not None:
+                        chunk_prices[sym] = price * Decimal(str(conv[1]))
 
             out.update(chunk_prices)
         return out
